@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,10 +12,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,42 +21,47 @@ import (
 	"time"
 )
 
+//go:embed probe.sh
+var remoteScriptContent string
+
 type CommandResult struct {
-	Command   string  `json:"command"`
-	ReturnCode int    `json:"return_code"`
-	Stdout    string  `json:"stdout"`
-	Stderr    string  `json:"stderr"`
-	DurationS float64 `json:"duration_s"`
+	Command    string  `json:"command"`
+	ReturnCode int     `json:"return_code"`
+	Stdout     string  `json:"stdout"`
+	Stderr     string  `json:"stderr"`
+	DurationS  float64 `json:"duration_s"`
 }
 
 type HostProbe struct {
-	Host              string            `json:"host"`
-	Target            string            `json:"target"`
-	IsLocal           bool              `json:"is_local"`
-	Reachable         bool              `json:"reachable"`
-	Error             string            `json:"error"`
-	Hostname          string            `json:"hostname"`
-	FQDN              string            `json:"fqdn"`
-	OSPrettyName      string            `json:"os_pretty_name"`
-	Kernel            string            `json:"kernel"`
-	GoVersion         string            `json:"go_version"`
-	Timezone          string            `json:"timezone"`
-	NTPServiceActive  *bool             `json:"ntp_service_active"`
-	NTPSynchronized   *bool             `json:"ntp_synchronized"`
-	LocalRTC          *bool             `json:"local_rtc"`
-	LocaltimePath     string            `json:"localtime_path"`
-	LocaltimeSHA256   string            `json:"localtime_sha256"`
-	ZoneinfoPath      string            `json:"zoneinfo_path"`
-	ZoneinfoSHA256    string            `json:"zoneinfo_sha256"`
-	NowISO            string            `json:"now_iso"`
-	NowEpoch          *int64            `json:"now_epoch"`
-	UTCOffset         string            `json:"utc_offset"`
-	TZAbbrev          string            `json:"tz_abbrev"`
-	TimedatectlAvail  bool              `json:"timedatectl_available"`
-	Source            string            `json:"source"`
-	Warnings          []string          `json:"warnings"`
-	RawFields         map[string]string `json:"raw_fields"`
-	CommandLog        []CommandResult   `json:"command_log"`
+	Host               string            `json:"host"`
+	Target             string            `json:"target"`
+	IsLocal            bool              `json:"is_local"`
+	Reachable          bool              `json:"reachable"`
+	Error              string            `json:"error"`
+	Hostname           string            `json:"hostname"`
+	FQDN               string            `json:"fqdn"`
+	OSPrettyName       string            `json:"os_pretty_name"`
+	Kernel             string            `json:"kernel"`
+	GoVersion          string            `json:"go_version"`
+	Timezone           string            `json:"timezone"`
+	NTPServiceActive   *bool             `json:"ntp_service_active"`
+	NTPSynchronized    *bool             `json:"ntp_synchronized"`
+	LocalRTC           *bool             `json:"local_rtc"`
+	LocaltimePath      string            `json:"localtime_path"`
+	LocaltimeSHA256    string            `json:"localtime_sha256"`
+	ZoneinfoPath       string            `json:"zoneinfo_path"`
+	ZoneinfoSHA256     string            `json:"zoneinfo_sha256"`
+	NowISO             string            `json:"now_iso"`
+	NowEpoch           *int64            `json:"now_epoch"`
+	UTCOffset          string            `json:"utc_offset"`
+	TZAbbrev           string            `json:"tz_abbrev"`
+	TimedatectlAvail   bool              `json:"timedatectl_available"`
+	Source             string            `json:"source"`
+	Warnings           []string          `json:"warnings"`
+	RawFields          map[string]string `json:"raw_fields"`
+	CommandLog         []CommandResult   `json:"command_log"`
+	ProbeVersion       int               `json:"probe_version"`
+	IncompatibleProbe  bool              `json:"incompatible_probe"`
 }
 
 type ComparisonIssue struct {
@@ -95,11 +98,12 @@ type RemoteExecutor struct {
 	ConnectTimeout int
 }
 
-func (r *RemoteExecutor) Run(target string, command string, isLocal bool) CommandResult {
+func (r *RemoteExecutor) Run(ctx context.Context, target string, command string, isLocal bool) CommandResult {
 	start := time.Now()
 	var cmd *exec.Cmd
+
 	if isLocal {
-		cmd = exec.Command("bash", "-lc", command)
+		cmd = exec.CommandContext(ctx, "bash", "-c", command)
 	} else {
 		sshTarget := target
 		if r.SSHUser != "" && !strings.Contains(target, "@") {
@@ -113,25 +117,35 @@ func (r *RemoteExecutor) Run(target string, command string, isLocal bool) Comman
 		}
 		args = append(args, r.SSHOptions...)
 		args = append(args, sshTarget, command)
-		cmd = exec.Command("ssh", args...)
+		cmd = exec.CommandContext(ctx, "ssh", args...)
 	}
+
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
 	err := cmd.Run()
 	rc := 0
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			rc = exitErr.ExitCode()
-		} else {
-			rc = 255
+		if ctx.Err() == context.DeadlineExceeded {
+			rc = 124
 			if stderr.Len() == 0 {
-				stderr.WriteString(err.Error())
+				stderr.WriteString("command timed out")
+			}
+		} else {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				rc = exitErr.ExitCode()
+			} else {
+				rc = 255
+				if stderr.Len() == 0 {
+					stderr.WriteString(err.Error())
+				}
 			}
 		}
 	}
+
 	return CommandResult{
 		Command:    command,
 		ReturnCode: rc,
@@ -145,19 +159,21 @@ type HostInspector struct {
 	Executor *RemoteExecutor
 }
 
-func (h *HostInspector) Inspect(target string, localAliases []string) HostProbe {
+func (h *HostInspector) Inspect(ctx context.Context, target string, localAliases []string) HostProbe {
 	isLocal := isLocalTarget(target, localAliases)
 	probe := HostProbe{
-		Host:      target,
-		Target:    target,
-		IsLocal:   isLocal,
-		Reachable: false,
-		RawFields: map[string]string{},
-		Warnings:  []string{},
+		Host:       target,
+		Target:     target,
+		IsLocal:    isLocal,
+		Reachable:  false,
+		RawFields:  map[string]string{},
+		Warnings:   []string{},
 		CommandLog: []CommandResult{},
 	}
-	result := h.Executor.Run(target, remoteScript(), isLocal)
+
+	result := h.Executor.Run(ctx, target, remoteScriptContent, isLocal)
 	probe.CommandLog = append(probe.CommandLog, result)
+
 	if result.ReturnCode != 0 {
 		probe.Error = cleanText(result.Stderr)
 		if probe.Error == "" {
@@ -165,8 +181,21 @@ func (h *HostInspector) Inspect(target string, localAliases []string) HostProbe 
 		}
 		return probe
 	}
+
 	raw := parseKeyValueOutput(result.Stdout)
 	probe.RawFields = raw
+
+	versionStr := raw["host_probe_version"]
+	if versionStr != "" {
+		if v, err := strconv.Atoi(versionStr); err == nil {
+			probe.ProbeVersion = v
+			if v != 1 {
+				probe.IncompatibleProbe = true
+				probe.Warnings = append(probe.Warnings, fmt.Sprintf("incompatible_probe_version_%d", v))
+			}
+		}
+	}
+
 	probe.Reachable = true
 	probe.Hostname = raw["hostname"]
 	probe.FQDN = raw["fqdn"]
@@ -185,11 +214,13 @@ func (h *HostInspector) Inspect(target string, localAliases []string) HostProbe 
 	probe.UTCOffset = raw["utc_offset"]
 	probe.TZAbbrev = raw["tz_abbrev"]
 	probe.TimedatectlAvail = strings.EqualFold(raw["timedatectl_available"], "true")
+
 	if epochRaw := raw["now_epoch"]; epochRaw != "" {
 		if parsed, err := strconv.ParseInt(epochRaw, 10, 64); err == nil {
 			probe.NowEpoch = &parsed
 		}
 	}
+
 	if probe.Timezone == "" {
 		probe.Warnings = append(probe.Warnings, "timezone_unresolved")
 	}
@@ -208,11 +239,13 @@ func (h *HostInspector) Inspect(target string, localAliases []string) HostProbe 
 	if probe.ZoneinfoPath != "" && probe.ZoneinfoSHA256 == "" {
 		probe.Warnings = append(probe.Warnings, "zoneinfo_hash_unresolved")
 	}
+
 	if isLocal {
 		probe.Source = "local"
 	} else {
 		probe.Source = "ssh"
 	}
+
 	return probe
 }
 
@@ -232,26 +265,30 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 		ClockSkewWithinThreshold:  true,
 		Issues:                    []ComparisonIssue{},
 	}
+
 	reachable := make([]HostProbe, 0)
 	for _, p := range probes {
-		if p.Reachable {
+		if p.Reachable && !p.IncompatibleProbe {
 			reachable = append(reachable, p)
 		}
 	}
+
 	if len(reachable) == 0 {
 		summary.Issues = append(summary.Issues, ComparisonIssue{
 			Category: "reachability",
 			Severity: "critical",
-			Message:  "No reachable hosts to compare",
+			Message:  "No reachable hosts with compatible probe version to compare",
 		})
 		return summary
 	}
+
 	ref := reachable[0]
 	if ref.Hostname != "" {
 		summary.ReferenceHost = ref.Hostname
 	} else {
 		summary.ReferenceHost = ref.Host
 	}
+
 	c.checkUniformString(&summary, reachable, "timezone")
 	c.checkUniformString(&summary, reachable, "localtime_target")
 	c.checkUniformString(&summary, reachable, "localtime_hash")
@@ -259,6 +296,7 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 	c.checkUniformBool(&summary, reachable, "ntp")
 	c.checkUniformBool(&summary, reachable, "synchronized")
 	c.checkUniformString(&summary, reachable, "utc_offset")
+
 	var epochs []int64
 	var epochHosts []string
 	for _, p := range reachable {
@@ -267,6 +305,7 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 			epochHosts = append(epochHosts, displayName(p))
 		}
 	}
+
 	if len(epochs) >= 2 {
 		minEpoch := epochs[0]
 		maxEpoch := epochs[0]
@@ -290,6 +329,7 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 			})
 		}
 	}
+
 	var unreachable []string
 	for _, p := range probes {
 		if !p.Reachable {
@@ -304,6 +344,22 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 			Hosts:    unreachable,
 		})
 	}
+
+	var incompatible []string
+	for _, p := range probes {
+		if p.Reachable && p.IncompatibleProbe {
+			incompatible = append(incompatible, displayName(p))
+		}
+	}
+	if len(incompatible) > 0 {
+		summary.Issues = append(summary.Issues, ComparisonIssue{
+			Category: "compatibility",
+			Severity: "warning",
+			Message:  "Hosts with incompatible probe version",
+			Hosts:    incompatible,
+		})
+	}
+
 	var partial []string
 	for _, p := range reachable {
 		if len(p.Warnings) > 0 {
@@ -318,6 +374,7 @@ func (c *Comparator) Compare(probes []HostProbe) ComparisonSummary {
 			Hosts:    partial,
 		})
 	}
+
 	return summary
 }
 
@@ -339,6 +396,7 @@ func (c *Comparator) checkUniformString(summary *ComparisonSummary, probes []Hos
 		}
 		values[v] = append(values[v], displayName(p))
 	}
+
 	var nonEmpty []string
 	for k := range values {
 		if k != "" {
@@ -347,6 +405,7 @@ func (c *Comparator) checkUniformString(summary *ComparisonSummary, probes []Hos
 	}
 	sort.Strings(nonEmpty)
 	consistent := len(uniqueStrings(nonEmpty)) <= 1
+
 	switch category {
 	case "timezone":
 		summary.TimezoneConsistent = consistent
@@ -359,6 +418,7 @@ func (c *Comparator) checkUniformString(summary *ComparisonSummary, probes []Hos
 	case "utc_offset":
 		summary.UTCOffsetConsistent = consistent
 	}
+
 	if !consistent {
 		var detail []string
 		keys := make([]string, 0, len(values))
@@ -392,6 +452,7 @@ func (c *Comparator) checkUniformBool(summary *ComparisonSummary, probes []HostP
 		}
 		values[key] = append(values[key], displayName(p))
 	}
+
 	var meaningful []string
 	for k := range values {
 		if k != "unknown" {
@@ -400,12 +461,14 @@ func (c *Comparator) checkUniformBool(summary *ComparisonSummary, probes []HostP
 	}
 	sort.Strings(meaningful)
 	consistent := len(uniqueStrings(meaningful)) <= 1
+
 	switch category {
 	case "ntp":
 		summary.NTPConsistent = consistent
 	case "synchronized":
 		summary.SynchronizedConsistent = consistent
 	}
+
 	if !consistent {
 		var detail []string
 		keys := make([]string, 0, len(values))
@@ -433,6 +496,7 @@ type Formatter struct {
 func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) string {
 	headers := []string{"host", "reachable", "timezone", "utc_offset", "tz", "ntp", "synced", "localtime_target", "local_sha256", "epoch"}
 	rows := [][]string{headers}
+
 	for _, p := range probes {
 		row := []string{
 			displayName(p),
@@ -448,6 +512,7 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 		}
 		rows = append(rows, row)
 	}
+
 	widths := make([]int, len(headers))
 	for _, row := range rows {
 		for i, cell := range row {
@@ -460,10 +525,12 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 			}
 		}
 	}
+
 	var b strings.Builder
 	b.WriteString("Timezone Consistency Report\n")
 	b.WriteString(strings.Repeat("-", min(f.Width, 120)))
 	b.WriteString("\n")
+
 	for idx, row := range rows {
 		for i, cell := range row {
 			if i > 0 {
@@ -482,9 +549,11 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 			b.WriteString("\n")
 		}
 	}
+
 	b.WriteString("\nSummary\n")
 	b.WriteString(strings.Repeat("-", min(f.Width, 120)))
 	b.WriteString("\n")
+
 	checks := []struct {
 		Name  string
 		Value bool
@@ -498,6 +567,7 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 		{"utc_offset_consistent", summary.UTCOffsetConsistent},
 		{"clock_skew_within_threshold", summary.ClockSkewWithinThreshold},
 	}
+
 	for _, c := range checks {
 		state := "OK"
 		if !c.Value {
@@ -505,12 +575,14 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 		}
 		b.WriteString(fmt.Sprintf("%s: %s\n", c.Name, state))
 	}
+
 	if summary.MaxClockSkewSeconds != nil {
 		b.WriteString(fmt.Sprintf("max_clock_skew_seconds: %d\n", *summary.MaxClockSkewSeconds))
 	}
 	if summary.ReferenceHost != "" {
 		b.WriteString(fmt.Sprintf("reference_host: %s\n", summary.ReferenceHost))
 	}
+
 	if len(summary.Issues) > 0 {
 		b.WriteString("\nIssues\n")
 		for _, issue := range summary.Issues {
@@ -523,9 +595,11 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 	} else {
 		b.WriteString("\nNo comparison issues detected\n")
 	}
+
 	b.WriteString("\nHost Details\n")
 	b.WriteString(strings.Repeat("-", min(f.Width, 120)))
 	b.WriteString("\n")
+
 	for idx, p := range probes {
 		b.WriteString(fmt.Sprintf("%s: %s\n", displayName(p), map[bool]string{true: "reachable", false: "unreachable"}[p.Reachable]))
 		if !p.Reachable {
@@ -549,6 +623,9 @@ func (f *Formatter) RenderTable(probes []HostProbe, summary ComparisonSummary) s
 			b.WriteString(fmt.Sprintf("  zoneinfo_sha256: %s\n", emptyDash(p.ZoneinfoSHA256)))
 			b.WriteString(fmt.Sprintf("  now_iso: %s\n", emptyDash(p.NowISO)))
 			b.WriteString(fmt.Sprintf("  now_epoch: %s\n", epochString(p.NowEpoch)))
+			if p.IncompatibleProbe {
+				b.WriteString(fmt.Sprintf("  warning: incompatible probe version %d\n", p.ProbeVersion))
+			}
 			if len(p.Warnings) > 0 {
 				b.WriteString(fmt.Sprintf("  warnings: %s\n", strings.Join(p.Warnings, ", ")))
 			}
@@ -595,6 +672,8 @@ type Config struct {
 	ShowCommands  bool
 	LocalAliases  []string
 	Strict        bool
+	GlobalTimeout int
+	Retries       int
 }
 
 func parseArgs() Config {
@@ -610,6 +689,9 @@ func parseArgs() Config {
 	var skewThreshold int64
 	var showCommands bool
 	var strict bool
+	var globalTimeout int
+	var retries int
+
 	flag.StringVar(&hostsFile, "hosts-file", "", "")
 	flag.StringVar(&sshUser, "ssh-user", "", "")
 	flag.IntVar(&sshPort, "ssh-port", 22, "")
@@ -622,7 +704,10 @@ func parseArgs() Config {
 	flag.BoolVar(&showCommands, "show-commands", false, "")
 	flag.Var(&localAliases, "local-alias", "")
 	flag.BoolVar(&strict, "strict", false, "")
+	flag.IntVar(&globalTimeout, "global-timeout", 300, "")
+	flag.IntVar(&retries, "retries", 0, "")
 	flag.Parse()
+
 	return Config{
 		Hosts:         flag.Args(),
 		HostsFile:     hostsFile,
@@ -637,71 +722,103 @@ func parseArgs() Config {
 		ShowCommands:  showCommands,
 		LocalAliases:  localAliases,
 		Strict:        strict,
+		GlobalTimeout: globalTimeout,
+		Retries:       retries,
 	}
 }
 
 func main() {
 	cfg := parseArgs()
+
 	targets, err := collectTargets(cfg.Hosts, cfg.HostsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+
 	if cfg.Workers <= 0 {
 		fmt.Fprintln(os.Stderr, "workers must be positive")
 		os.Exit(1)
 	}
+
 	executor := &RemoteExecutor{
 		SSHUser:        cfg.SSHUser,
 		SSHPort:        cfg.SSHPort,
 		SSHOptions:     cfg.SSHOptions,
 		ConnectTimeout: cfg.Timeout,
 	}
+
 	inspector := &HostInspector{Executor: executor}
 	comparator := &Comparator{SkewThresholdSeconds: cfg.SkewThreshold}
 	formatter := &Formatter{UseColor: !cfg.NoColor && !cfg.JSON, Width: 120}
-	probes := inspectTargets(targets, cfg.Workers, inspector, cfg.LocalAliases)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.GlobalTimeout)*time.Second)
+	defer cancel()
+
+	probes := inspectTargets(ctx, targets, cfg.Workers, cfg.Retries, inspector, cfg.LocalAliases)
+
 	sort.SliceStable(probes, func(i, j int) bool {
 		return indexOf(targets, probes[i].Target) < indexOf(targets, probes[j].Target)
 	})
+
 	summary := comparator.Compare(probes)
+
 	if cfg.ShowCommands && !cfg.JSON {
 		printCommandLogs(probes)
 	}
+
 	if cfg.JSON {
 		fmt.Println(formatter.RenderJSON(probes, summary))
 	} else {
 		fmt.Print(formatter.RenderTable(probes, summary))
 	}
+
 	os.Exit(computeExitCode(summary, probes, cfg.Strict))
 }
 
-func inspectTargets(targets []string, workers int, inspector *HostInspector, localAliases []string) []HostProbe {
+func inspectTargets(ctx context.Context, targets []string, workers int, retries int, inspector *HostInspector, localAliases []string) []HostProbe {
 	type item struct {
 		Index int
 		Host  string
 	}
+
 	jobs := make(chan item)
 	results := make(chan HostProbe, len(targets))
 	var wg sync.WaitGroup
+
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				probe := inspector.Inspect(job.Host, localAliases)
+				var probe HostProbe
+				for attempt := 0; attempt <= retries; attempt++ {
+					probe = inspector.Inspect(ctx, job.Host, localAliases)
+					if probe.Reachable {
+						break
+					}
+					if attempt < retries {
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+					}
+				}
 				results <- probe
 			}
 		}()
 	}
+
 	go func() {
 		for idx, host := range targets {
-			jobs <- item{Index: idx, Host: host}
+			select {
+			case jobs <- item{Index: idx, Host: host}:
+			case <-ctx.Done():
+				break
+			}
 		}
 		close(jobs)
 		wg.Wait()
 		close(results)
 	}()
+
 	var probes []HostProbe
 	for probe := range results {
 		probes = append(probes, probe)
@@ -731,6 +848,7 @@ func readHostsFromFile(path string) ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
+
 	var hosts []string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -950,155 +1068,4 @@ func indexOf(values []string, target string) int {
 		}
 	}
 	return len(values)
-}
-
-func remoteScript() string {
-	return `set -u
-
-emit() {
-  printf '%s=%s\n' "$1" "$2"
-}
-
-boolify() {
-  case "${1:-}" in
-    yes|true|1) printf 'true' ;;
-    no|false|0) printf 'false' ;;
-    *) printf 'unknown' ;;
-  esac
-}
-
-sha256_of_file() {
-  if [ -f "$1" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum "$1" | awk '{print $1}'
-      return 0
-    fi
-    if command -v openssl >/dev/null 2>&1; then
-      openssl dgst -sha256 "$1" | awk '{print $NF}'
-      return 0
-    fi
-  fi
-  printf ''
-}
-
-os_pretty_name=''
-if [ -r /etc/os-release ]; then
-  os_pretty_name=$(awk -F= '/^PRETTY_NAME=/{gsub(/^"/, "", $2); gsub(/"$/, "", $2); print $2}' /etc/os-release 2>/dev/null)
-fi
-
-hostname_short=$(hostname 2>/dev/null || printf '')
-hostname_fqdn=$(hostname -f 2>/dev/null || printf '')
-kernel=$(uname -srmo 2>/dev/null || printf '')
-go_version=$(go version 2>/dev/null | awk '{print $3}')
-if [ -z "$go_version" ]; then
-  go_version=''
-fi
-
-timedatectl_available=false
-timezone=''
-ntp_enabled='unknown'
-ntp_synced='unknown'
-local_rtc='unknown'
-
-if command -v timedatectl >/dev/null 2>&1; then
-  timedatectl_available=true
-  while IFS='=' read -r key value; do
-    case "$key" in
-      Timezone) timezone="$value" ;;
-      NTP) ntp_enabled=$(boolify "$value") ;;
-      NTPSynchronized) ntp_synced=$(boolify "$value") ;;
-      LocalRTC) local_rtc=$(boolify "$value") ;;
-    esac
-  done < <(timedatectl show --property=Timezone --property=NTP --property=NTPSynchronized --property=LocalRTC 2>/dev/null)
-fi
-
-if [ -z "$timezone" ] && [ -r /etc/timezone ]; then
-  timezone=$(head -n1 /etc/timezone 2>/dev/null)
-fi
-
-localtime_path=$(readlink -f /etc/localtime 2>/dev/null || printf '')
-localtime_hash=$(sha256_of_file /etc/localtime)
-zoneinfo_path=''
-zoneinfo_hash=''
-
-if [ -n "$timezone" ] && [ -f "/usr/share/zoneinfo/$timezone" ]; then
-  zoneinfo_path="/usr/share/zoneinfo/$timezone"
-  zoneinfo_hash=$(sha256_of_file "$zoneinfo_path")
-fi
-
-now_iso=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf '')
-now_epoch=$(date '+%s' 2>/dev/null || printf '')
-utc_offset=$(date '+%z' 2>/dev/null || printf '')
-tz_abbrev=$(date '+%Z' 2>/dev/null || printf '')
-
-emit host_probe_version 1
-emit hostname "$hostname_short"
-emit fqdn "$hostname_fqdn"
-emit os_pretty_name "$os_pretty_name"
-emit kernel "$kernel"
-emit go_version "$go_version"
-emit timedatectl_available "$timedatectl_available"
-emit timezone "$timezone"
-emit ntp_service_active "$ntp_enabled"
-emit ntp_synchronized "$ntp_synced"
-emit local_rtc "$local_rtc"
-emit localtime_path "$localtime_path"
-emit localtime_sha256 "$localtime_hash"
-emit zoneinfo_path "$zoneinfo_path"
-emit zoneinfo_sha256 "$zoneinfo_hash"
-emit now_iso "$now_iso"
-emit now_epoch "$now_epoch"
-emit utc_offset "$utc_offset"
-emit tz_abbrev "$tz_abbrev"`
-}
-
-func currentUserName() string {
-	u, err := user.Current()
-	if err != nil {
-		return ""
-	}
-	return u.Username
-}
-
-func localSHA256(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-func localProbeFallback() HostProbe {
-	now := time.Now()
-	host, _ := os.Hostname()
-	p := HostProbe{
-		Host:        "localhost",
-		Target:      "localhost",
-		IsLocal:     true,
-		Reachable:   true,
-		Hostname:    host,
-		FQDN:        host,
-		GoVersion:   runtime.Version(),
-		NowISO:      now.Format("2006-01-02T15:04:05-0700"),
-		UTCOffset:   now.Format("-0700"),
-		TZAbbrev:    now.Format("MST"),
-		Source:      "local",
-		RawFields:   map[string]string{},
-		Warnings:    []string{},
-		CommandLog:  []CommandResult{},
-	}
-	epoch := now.Unix()
-	p.NowEpoch = &epoch
-	if path, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
-		p.LocaltimePath = path
-		p.LocaltimeSHA256 = localSHA256("/etc/localtime")
-	}
-	return p
-}
-
-func init() {
-	_ = slices.Index([]int{1, 2, 3}, 2)
-	_ = currentUserName()
-	_ = localProbeFallback()
 }
